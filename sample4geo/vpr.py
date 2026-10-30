@@ -1,0 +1,170 @@
+import math
+import timm
+import torch
+from torch import nn
+
+# Code adapted from OpenGlue, MIT license
+# https://github.com/ucuapps/OpenGlue/blob/main/models/superglue/optimal_transport.py
+def log_otp_solver(log_a, log_b, M, num_iters: int = 20, reg: float = 1.0) -> torch.Tensor:
+    r"""Sinkhorn matrix scaling algorithm for Differentiable Optimal Transport problem.
+    This function solves the optimization problem and returns the OT matrix for the given parameters.
+    Args:
+        log_a : torch.Tensor
+            Source weights
+        log_b : torch.Tensor
+            Target weights
+        M : torch.Tensor
+            metric cost matrix
+        num_iters : int, default=100
+            The number of iterations.
+        reg : float, default=1.0
+            regularization value
+    """
+    M = M / reg  # regularization
+
+    u, v = torch.zeros_like(log_a), torch.zeros_like(log_b)
+
+    for _ in range(num_iters):
+        u = log_a - torch.logsumexp(M + v.unsqueeze(1), dim=2).squeeze()
+        v = log_b - torch.logsumexp(M + u.unsqueeze(2), dim=1).squeeze()
+
+    return M + u.unsqueeze(2) + v.unsqueeze(1)
+
+# Code adapted from OpenGlue, MIT license
+# https://github.com/ucuapps/OpenGlue/blob/main/models/superglue/superglue.py
+def get_matching_probs(S, dustbin_score = 1.0, num_iters=3, reg=1.0):
+    """sinkhorn"""
+    batch_size, m, n = S.size()
+    # augment scores matrix
+    S_aug = torch.empty(batch_size, m + 1, n, dtype=S.dtype, device=S.device)
+    S_aug[:, :m, :n] = S
+    S_aug[:, m, :] = dustbin_score
+
+    # prepare normalized source and target log-weights
+    norm = -torch.tensor(math.log(n + m), device=S.device)
+    log_a, log_b = norm.expand(m + 1).contiguous(), norm.expand(n).contiguous()
+    log_a[-1] = log_a[-1] + math.log(n-m)
+    log_a, log_b = log_a.expand(batch_size, -1), log_b.expand(batch_size, -1)
+    log_P = log_otp_solver(
+        log_a,
+        log_b,
+        S_aug,
+        num_iters=num_iters,
+        reg=reg
+    )
+    return log_P - norm
+
+class SALAD(nn.Module):
+    """
+    This class represents the Sinkhorn Algorithm for Locally Aggregated Descriptors (SALAD) model.
+
+    Attributes:
+        num_channels (int): The number of channels of the inputs (d).
+        num_clusters (int): The number of clusters in the model (m).
+        cluster_dim (int): The number of channels of the clusters (l).
+        token_dim (int): The dimension of the global scene token (g).
+        dropout (float): The dropout rate.
+    """
+    def __init__(self,
+            config
+        ) -> None:
+        super().__init__()
+        num_channels = 1024
+        self.num_clusters = config.num_clusters
+        self.cluster_dim = config.cluster_dim
+        self.sinkhorn_iter = config.sinkhorn_iter
+        print(f"SALAD cluster num: {self.num_clusters}, dim: {self.cluster_dim}")
+        
+        dropout = nn.Dropout(0.1)
+        # dropout = nn.Identity()
+
+        # MLP for global scene token g
+        # self.token_features = nn.Sequential(
+        #     nn.Linear(self.num_channels, 512),
+        #     nn.ReLU(),
+        #     nn.Linear(512, self.token_dim)
+        # )
+        
+        # normalize input features
+        # self.pre_norm = nn.LayerNorm(num_channels)
+        
+        # # MLP for local features f_i
+        # self.cluster_features = nn.Sequential(
+        #     nn.Conv2d(num_channels, 512, 1),
+        #     nn.GELU(),
+        #     dropout,
+        #     nn.Conv2d(512, self.cluster_dim, 1)
+        # )
+        
+        # # MLP for score matrix S
+        # self.score = nn.Sequential(
+        #     nn.Conv2d(num_channels, 512, 1),
+        #     nn.GELU(),
+        #     dropout,
+        #     nn.Conv2d(512, self.num_clusters, 1),
+        # )
+        
+        # 強化後的 MLP for local features f_i
+        self.cluster_features = nn.Sequential(
+            # 1. 深度卷積 (DW Conv): 捕捉局部空間關係
+            nn.Conv2d(num_channels, num_channels, kernel_size=3, padding=1, groups=num_channels),
+            # 2. 點卷積 (PW Conv): 降維並融合通道
+            nn.Conv2d(num_channels, 512, 1),
+            nn.GELU(),
+            dropout,
+            nn.Conv2d(512, self.cluster_dim, 1) # 最終投影到 cluster_dim
+        )
+        
+        # 強化後的 MLP for score matrix S
+        self.score = nn.Sequential(
+            # 1. 深度卷積 (DW Conv)
+            nn.Conv2d(num_channels, num_channels, kernel_size=3, padding=1, groups=num_channels),
+            # 2. 點卷積 (PW Conv)
+            nn.Conv2d(num_channels, 512, 1),
+            nn.GELU(),
+            dropout,
+            nn.Conv2d(512, self.num_clusters, 1), # 最終投影到 num_clusters
+        )
+        
+        # Dustbin parameter z
+        self.dust_bin = nn.Parameter(torch.tensor(1.0))
+
+    def forward(self, feature_map):
+        """
+        x (torch.Tensor): The feature tensors (t_i) [B, C, H, W].
+
+        Returns:
+            f (torch.Tensor): The global descriptor [B, m*l]
+        """
+        
+        f = self.cluster_features(feature_map).flatten(2)   # (B, cluster_dim, h * w)
+        p = self.score(feature_map).flatten(2)              # (B, num_clusters, h * w)
+
+        # Sinkhorn algorithm
+        p = get_matching_probs(p, self.dust_bin, self.sinkhorn_iter)
+        p = torch.exp(p)
+        # Normalize to maintain mass
+        p = p[:, :-1, :]
+        
+        p = p.unsqueeze(1).repeat(1, self.cluster_dim, 1, 1)
+        f = f.unsqueeze(2).repeat(1, 1, self.num_clusters, 1)
+        feature = (f * p).sum(dim=-1).flatten(1)
+        
+        # return nn.functional.normalize(feature, dim=-1)
+        return feature
+
+        # f = torch.cat([
+        #     nn.functional.normalize(t, p=2, dim=-1),
+        #     nn.functional.normalize((f * p).sum(dim=-1), p=2, dim=1).flatten(1)
+        # ], dim=-1)
+        # feature = torch.einsum("BCN,BKN->BKC", f, p).flatten(1)
+        
+        
+class FakeSALAD(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        model = timm.create_model(config.model, pretrained=True, num_classes=0)
+        self.head = model.head
+        
+    def forward(self, feature_map):
+        return self.head(feature_map)
